@@ -1,0 +1,80 @@
+# External uptime check. Runs outside every server, so it still speaks when one dies.
+# Targets come from the TARGETS secret and are masked in logs; state.txt keeps only short hashes.
+name: uptime
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: uptime
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check targets
+        id: check
+        env:
+          TARGETS: ${{ secrets.TARGETS }}
+        run: |
+          set -u
+          down=""; downurls=""; n=0
+          while IFS= read -r url; do
+            url="$(echo "$url" | xargs)"
+            [ -z "$url" ] && continue
+            n=$((n+1)); echo "::add-mask::$url"
+            h=$(printf %s "$url" | sha256sum | cut -c1-8)
+            ok=0
+            for attempt in 1 2 3; do
+              code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 20 -L "$url" || echo 000)
+              if [ "$code" -ge 200 ] && [ "$code" -lt 400 ]; then ok=1; break; fi
+              sleep 15
+            done
+            if [ "$ok" = 1 ]; then echo "UP   #$n"; else echo "DOWN #$n ($code)"; down="$down$h\n"; downurls="$downurls$h $url ($code)\n"; fi
+          done <<< "$TARGETS"
+          printf "%b" "$down" | sort > now.txt
+          touch state.txt
+          new=$(comm -13 <(sort state.txt) now.txt || true)
+          back=$(comm -23 <(sort state.txt) now.txt || true)
+          names() { for h in $1; do printf "%b" "$downurls" | grep "^$h " | cut -d' ' -f2- || echo "$h"; done; }
+          { echo "new<<EOF"; names "$new"; echo "EOF"; echo "back<<EOF"; echo "$back"; echo "EOF"; } >> "$GITHUB_OUTPUT"
+          { echo "count=$(echo "$new" | grep -c . || true)"; } >> "$GITHUB_OUTPUT"
+          cp now.txt state.txt
+
+      - name: Telegram
+        if: steps.check.outputs.new != '' || steps.check.outputs.back != ''
+        env:
+          TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
+          NEW: ${{ steps.check.outputs.new }}
+          BACK: ${{ steps.check.outputs.back }}
+        run: |
+          [ -z "$TOKEN" ] || [ -z "$CHAT" ] && { echo "Telegram não configurado"; exit 0; }
+          msg=""
+          [ -n "$NEW" ] && msg="🔴 FORA DO AR (vigia externo):\n$NEW\n"
+          [ -n "$BACK" ] && msg="$msg🟢 Voltou (hash): $BACK"
+          curl -s -X POST "https://api.telegram.org/bot$TOKEN/sendMessage" \
+            --data-urlencode "chat_id=$CHAT" --data-urlencode "text=$(printf "%b" "$msg")" > /dev/null
+
+      - name: Save state
+        run: |
+          git config user.name "uptime"; git config user.email "uptime@users.noreply.github.com"
+          # Monthly heartbeat commit keeps GitHub from disabling the schedule after 60 idle days.
+          date -u +%Y-%m > last-month.txt
+          git add state.txt last-month.txt
+          git diff --cached --quiet || { git commit -q -m "estado"; git push -q; }
+
+      - name: Fail on new outage (GitHub e-mail as fallback alert)
+        if: steps.check.outputs.new != ''
+        run: |
+          echo "::error::${{ steps.check.outputs.count }} alvo(s) fora do ar"
+          exit 1
